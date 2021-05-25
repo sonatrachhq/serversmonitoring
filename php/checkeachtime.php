@@ -1,111 +1,114 @@
-
 <?php
-
-use PHPMailer\PHPMailer\PHPMailer;
-use PHPMailer\PHPMailer\Exception;
-
-require 'PHPMailer/src/Exception.php';
-require 'PHPMailer/src/PHPMailer.php';
-require 'PHPMailer/src/SMTP.php';
 
 include('phpseclib/Net/SSH2.php');  //Include this library so that we can manipulate SSH sessions
 
-
-$db = "(DESCRIPTION =
-    (ADDRESS = (PROTOCOL = TCP)(HOST = 10.100.22.85)(PORT = 1521))
-    (CONNECT_DATA =
-    (SERVER = DEDICATED)
-    (SERVICE_NAME = PDBEXPDPT)
-    )
-)" ;    // Tnsname of the server DEV16 that we will store all our data in it
-
-$conn = oci_connect('EXP_DBA', 'abd', $db);   // Connection to the database EXP_DBA
-
-    
-if (!$conn) 
-{
+require 'conn.php';
+      
+if (!$conn) {
     $m = oci_error();
     echo $m['message'], "\n";   //Return the error occured when the connection failed
     exit;
-}
-
-else 
-{
+} else {
     $data = array();
+    $data_app = array();
     $history = array();
+    $history_app = array();
     $now = new DateTime();
     
-    
-    $output = shell_exec("echo 'english' | su - oracle -c '/home/oracle/script.sh'");    //Run the shell script to check whether the databases are accessibles or not
-    echo $output;
-    $available_output = explode("\n", $output);
-    $s = oci_parse($conn, "SELECT * FROM servers");    // Select all columns from the "servers" table 
+    /* Check DB servers */
+    $s = oci_parse($conn, "SELECT * FROM servers where server_state = 1 order by server_type desc, server_id");    // Select all columns from the "servers" table 
     oci_execute($s);    //Execute the query above
     oci_fetch_all($s, $res, null, null, OCI_FETCHSTATEMENT_BY_ROW);     // Return a single sub array by rows
     
     foreach ($res as $row) {
-        $index = $row["SERVER_ID"] - 1;
-        $available = ($available_output[$index] == "OPEN") ? "Accessible" : "Inaccessible";
-        array_push($data, $available);
+        $inst = "(DESCRIPTION = (ADDRESS = (PROTOCOL = TCP)(HOST = ".$row["SERVER_ADDRESS"].")(PORT = 1521)) (CONNECT_DATA = (SERVER = DEDICATED) (SERVICE_NAME = ".$row["DB_SID"].")))" ;
+        $instance  = oci_connect("SYS", $row["DB_PASSWORD"], $inst, null, OCI_SYSDBA);
+        $f = oci_parse($instance, "select status from v\$instance");
+        oci_execute($f);
+        $result = oci_fetch_row($f);
+        if ($result[0] == "OPEN") array_push($data, "Accessible");
+        else array_push($data, "Inaccessible");
+        oci_close($instance);   
     }
-    
-    $f = oci_parse($conn, "select * from (select * from history order by history_id desc) where rownum<14 order by history_id"); // Select last 13 inserted rows from the "history" table to check if one of them change its availability status
-    oci_execute($f);    //Execute the query above
-    oci_fetch_all($f, $res, null, null, OCI_FETCHSTATEMENT_BY_ROW);     // Return a single sub array by rows
+  
+    $f = oci_parse($conn, "select AVAILABLE from (select * from history order by history_id desc) where rownum <= (select count(*) from servers where server_state = 1) order by history_id"); 
+    oci_execute($f);
+    oci_fetch_all($f, $res, null, null, OCI_FETCHSTATEMENT_BY_COLUMN);
+    array_push($history, $res["AVAILABLE"]);
 
+    /* Check APP servers */
+    $s = oci_parse($conn, "SELECT * FROM apps where app_state = 1 ORDER BY app_id"); 
+    oci_execute($s);
+    oci_fetch_all($s, $res, null, null, OCI_FETCHSTATEMENT_BY_ROW);
+    
     foreach ($res as $row) {
-        array_push($history, $row["AVAILABLE"]);
+        if ($row["APP_ID"] < 4) {
+          $ssh = new Net_SSH2($row["APP_ADDRESS"]);     //Open SSH session to specified server in the argument
+          if (!$ssh->login($row["APP_LOGIN"], $row["APP_PASSWORD"])) echo $row["APP_NAME"] . ': Login Failed. ';   // Message returned when connection failed
+          $available = $ssh->exec('/home/oracle/OraHomefrm/opmn/bin/opmnctl ping 4 | grep succeeded') ? "Accessible" : "Inaccessible";
+        } else {
+          $ip = $row["APP_ADDRESS"];
+          $ping = exec("ping -c 1 $ip", $output, $return_var); 
+          $available = ($return_var == 1) ? "Inaccessible" : "Accessible";
+        }
+        array_push($data_app, $available);
     }
     
-    if (($data != $history) || (($now->format('H:i') >= "06:00") && ($now->format('H:i') < "06:05"))) {
-        
-        // Instantiation and passing `true` enables exceptions
-        $mail = new PHPMailer(true);
-        
-        //Server settings
-        $mail->CharSet = 'UTF-8';
-        $mail->Encoding = 'base64'; 
-        $mail->SMTPDebug = 2;                                       // Enable verbose debug output
-        $mail->isSMTP();                                            // Set mailer to use SMTP
-        $mail->Host = 'webmail.sonatrach.dz';                        // Specify main and backup SMTP servers
-        $mail->SMTPAuth = false;                                  // Disable SMTP authentication
-        $mail->Priority = 1;
-        $mail->AddCustomHeader("X-MSMail-Priority: High");
-        $mail->AddCustomHeader("Importance: High");
-        $mail->setFrom('DG-ISI-DBA@Sonatrach.dz', 'DG-ISI-DBA');        // Add a sender
-        $mail->addAddress('DG-ISI-DBA@Sonatrach.dz');     // Add a recipient
-        $mail->isHTML(true);                                     // Set email format to HTML
+    $f = oci_parse($conn, "select AVAILABLE from (select * from history_app order by history_app_id desc) where rownum<= (select count(*) from apps where app_state = 1)  order by history_app_id"); 
+    oci_execute($f);
+    oci_fetch_all($f, $res, null, null, OCI_FETCHSTATEMENT_BY_COLUMN);
+    array_push($history_app, $res["AVAILABLE"]);
+ 
+    /* Send an email */    
+    if (($data != $history[0]) || ($data_app != $history_app[0]) || (($now->format('H:i') >= "06:00") && ($now->format('H:i') < "06:05"))) { 
+    
+        require 'smtp.php';
+        $mail->AddEmbeddedImage($ROOT_PATH . 'img/database_accessible.png', 'database_accessible');
+        $mail->AddEmbeddedImage($ROOT_PATH . 'img/database_inaccessible.png', 'database_inaccessible');
+        $mail->AddEmbeddedImage($ROOT_PATH . 'img/desktop_accessible.png', 'desktop_accessible');
+        $mail->AddEmbeddedImage($ROOT_PATH . 'img/desktop_inaccessible.png', 'desktop_inaccessible');
         $mail->Subject = 'Databases availability (' . date("d-m-Y H:i", strtotime("1 hour")) . ')';   // Set the email subject
-        $body = '<ul><br /><li><b>Database Development Servers :</b></li></ul><br />';
-        $body .= '<table style="border-collapse:collapse;border-spacing: 0;margin:0px auto;table-layout: fixed; width: 100%; font-family:Tahoma, Geneva, sans-serif;font-size:14px;">';
-        $body .= '<tr><th style="font-family:Tahoma, Geneva, sans-serif !important;;font-size:14px;font-weight:bold;padding:10px 5px;border-style:solid;border-width:1px;overflow:hidden;word-break:normal;border-color:#000000;background-color:#656565;color:#ffffff;text-align:center">ALGORA03</th><th style="font-family:Tahoma, Geneva, sans-serif !important;;font-size:14px;font-weight:bold;padding:10px 5px;border-style:solid;border-width:1px;overflow:hidden;word-break:normal;border-color:#000000;background-color:#656565;color:#ffffff;text-align:center">ALGORA04</th><th style="font-family:Tahoma, Geneva, sans-serif !important;;font-size:14px;font-weight:bold;padding:10px 5px;border-style:solid;border-width:1px;overflow:hidden;word-break:normal;border-color:#000000;background-color:#656565;color:#ffffff;text-align:center">ALGHFM08</th><th style="font-family:Tahoma, Geneva, sans-serif !important;;font-size:14px;font-weight:bold;padding:10px 5px;border-style:solid;border-width:1px;overflow:hidden;word-break:normal;border-color:#000000;background-color:#656565;color:#ffffff;text-align:center">KTPPPROD</th><th style="font-family:Tahoma, Geneva, sans-serif !important;;font-size:14px;font-weight:bold;padding:10px 5px;border-style:solid;border-width:1px;overflow:hidden;word-break:normal;border-color:#000000;background-color:#656565;color:#ffffff;text-align:center">ALGORA12</th><th style="font-family:Tahoma, Geneva, sans-serif !important;;font-size:14px;font-weight:bold;padding:10px 5px;border-style:solid;border-width:1px;overflow:hidden;word-break:normal;border-color:#000000;background-color:#656565;color:#ffffff;text-align:center">ALGORA13</th><th style="font-family:Tahoma, Geneva, sans-serif !important;;font-size:14px;font-weight:bold;padding:10px 5px;border-style:solid;border-width:1px;overflow:hidden;word-break:normal;border-color:#000000;background-color:#656565;color:#ffffff;text-align:center">ALGORA14</th></tr><tr>';
-        
-        for ($i = 0; $i < count($data); $i++) {
-
-            if ($i == 7) {
-                $body .= '</tr></table><br />';
-                $body .= '<br /><ul><li><b>Database Production Servers :</b></li></ul><br />';
-                $body .= '<table style="border-collapse:collapse;border-spacing: 0;margin:0px auto;table-layout: fixed; width: 100%; font-family:Tahoma, Geneva, sans-serif;font-size:14px;">';
-                $body .= '<tr><th style="font-family:Tahoma, Geneva, sans-serif !important;;font-size:14px;font-weight:bold;padding:10px 5px;border-style:solid;border-width:1px;overflow:hidden;word-break:normal;border-color:#000000;background-color:#656565;color:#ffffff;text-align:center">ALGORA05</th><th style="font-family:Tahoma, Geneva, sans-serif !important;;font-size:14px;font-weight:bold;padding:10px 5px;border-style:solid;border-width:1px;overflow:hidden;word-break:normal;border-color:#000000;background-color:#656565;color:#ffffff;text-align:center">ALGORA06</th><th style="font-family:Tahoma, Geneva, sans-serif !important;;font-size:14px;font-weight:bold;padding:10px 5px;border-style:solid;border-width:1px;overflow:hidden;word-break:normal;border-color:#000000;background-color:#656565;color:#ffffff;text-align:center">ALGORA07</th><th style="font-family:Tahoma, Geneva, sans-serif !important;;font-size:14px;font-weight:bold;padding:10px 5px;border-style:solid;border-width:1px;overflow:hidden;word-break:normal;border-color:#000000;background-color:#656565;color:#ffffff;text-align:center">ALGORA08</th><th style="font-family:Tahoma, Geneva, sans-serif !important;;font-size:14px;font-weight:bold;padding:10px 5px;border-style:solid;border-width:1px;overflow:hidden;word-break:normal;border-color:#000000;background-color:#656565;color:#ffffff;text-align:center">ALGORA09</th><th style="font-family:Tahoma, Geneva, sans-serif !important;;font-size:14px;font-weight:bold;padding:10px 5px;border-style:solid;border-width:1px;overflow:hidden;word-break:normal;border-color:#000000;background-color:#656565;color:#ffffff;text-align:center">ALGDWH01</th></tr><tr>';
+        $body = '<ul><li><b>Database Production Servers :</b></li></ul><br />';
+        $body .= '<table style="margin:0px auto;width:100%;font-family:Tahoma;font-size:14px;font-weight:normal;">';
+        $s = oci_parse($conn, "SELECT * FROM servers where server_state = 1 order by server_type desc, server_id");
+        oci_execute($s);
+        oci_fetch_all($s, $res, null, null, OCI_FETCHSTATEMENT_BY_ROW);
+        $change = true;
+        foreach ($res as $key=>$row) {
+            if ($row["SERVER_TYPE"] == 'DEV' && $change) {
+                $body .= '</table><br />';
+                $body .= '<br /><ul><li><b>Database Development Servers :</b></li></ul><br />';
+                $body .= '<table style="margin:0px auto;width:100%;font-family:Tahoma;font-size:14px;">';
+                $change = false;
             }
-            $background_color = ($data[$i] == "Accessible") ? '#92D050' : '#e54b4b';       
-            $body .= '<td style="padding:10px 15px;border-style:solid;border-width:1px;overflow:hidden;word-break:normal;border-color:inherit;background-color:' . $background_color . ';color:#ffffff;text-align:center">';
-            $body .= $data[$i];
-            $body .= '</td>';
-         
-              $h = oci_parse($conn, "INSERT INTO history (history_time, server_id, available) VALUES ('" . date('H:i:s', strtotime('1 hour')) . "', " . ($i + 1)   . ", '" . $data[$i] . "')");    // Insert in the history table, the exact time of execution, the reference to the server and the server avaibility
-              oci_execute($h);
-           
+            $cid = ($data[$key] == "Accessible") ? 'database_accessible' : 'database_inaccessible';
+            $body .= '<th style="padding:0 2%;border:1px solid transparent;text-align:center;font-weight:normal;">';
+            $body .= '<img src="cid:' . $cid . '" height="90" />';
+            $body .= '<p>' . $row["SERVER_NAME"] . '</p>';
+            $body .= '</th>';    
+            $h = oci_parse($conn, "INSERT INTO history (history_time, server_id, available) VALUES ('" . date('H:i:s', strtotime('1 hour')) . "', " . $row["SERVER_ID"]  . ", '" . $data[$key] . "')");   
+            oci_execute($h);
         }
+        $body .= '</table><br />';
         
-        $body .= '</tr></table>';
-        $bodies = explode("<ul>", $body);
-        $body = $bodies[2].$bodies[1].$bodies[3];
+        $body .= '<br /><ul><li><b>Application Servers :</b></li></ul><br />';
+        $body .= '<table style="margin:0px auto;width:100%;font-family:Tahoma;font-size:14px;">';
+        $s = oci_parse($conn, "SELECT * FROM apps where app_state = 1 order by app_id");
+        oci_execute($s);
+        oci_fetch_all($s, $res, null, null, OCI_FETCHSTATEMENT_BY_ROW);
+        foreach ($res as $key=>$row) {
+            $cid = ($data_app[$key] == "Accessible") ? 'desktop_accessible' : 'desktop_inaccessible';
+            $body .= '<th style="padding:0 2%;border:1px solid transparent;text-align:center;font-weight:normal;">';
+            $body .= '<img src="cid:' . $cid . '" height="90" />';
+            $body .= '<p>' . $row["APP_NAME"] . '</p>';
+            $body .= '</th>';
+            $h = oci_parse($conn, "INSERT INTO history_app (history_app_time, app_id, available) VALUES ('" . date('H:i:s', strtotime('1 hour')) . "', " . $row["APP_ID"]  . ", '" . $data_app[$key] . "')");
+            oci_execute($h);
+        }
+        $body .= '</table><br />';           
         $mail->Body = $body; // Set the email content
         $mail->send();
-        
     }
-
     oci_close($conn);  // Close the Oracle connection
 }
 

@@ -1,1 +1,0 @@
-‪C:\wamp\bin\php\php7.2.14\php.exe C:\wamp\www\DatabasesAvaibility\php\checkstatus.php

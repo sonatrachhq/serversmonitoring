@@ -1,4 +1,3 @@
-
 <?php
 
 include('phpseclib/Net/SSH2.php');  //Include this library so that we can manipulate SSH sessions
@@ -27,38 +26,20 @@ for ($i = 0; $i < count($prod_servers); $i++) {
     
     $ssh = new Net_SSH2('10.100.' . $prod_servers[$i]);     //Open SSH session to specified server in the argument
     
-    if (!$ssh->login('oracle', 'babel')) {     //Specify the username & the password for our SSH session
-        
-        exit('Login Failed');   //Message returned when connection failed
-    }
-
+    if (!$ssh->login('oracle', 'babel')) exit('Login Failed');
     echo $ssh->exec('./checkavaibility') ? "Accessible" : "Inaccessible";   //Run the shell script to check whether the database is accessible or not
     echo "\n";
     if ($i == 2) echo 100 - rtrim($ssh->exec('df -h | grep algisinfs.corp | grep -oh "\w*%"'), "%\n") . "%\n";       //Execute this command to check available disk space for the Backup partition
 
 }
 
+require 'conn.php';
 
-
-$db = "(DESCRIPTION =
-    (ADDRESS = (PROTOCOL = TCP)(HOST = 10.100.22.85)(PORT = 1521))
-    (CONNECT_DATA =
-    (SERVER = DEDICATED)
-    (SERVICE_NAME = PDBEXPDPT)
-    )
-)" ;    // Tnsname of the server DEV16 that we will store all our data in it
-
-$conn = oci_connect('EXP_DBA', 'abd', $db);   // Connection to the database EXP_DBA
-
-if (!$conn) 
-{
+if (!$conn) {
     $m = oci_error();
     echo $m['message'], "\n";   //Return the error occured when the connection failed
     exit;
-}
-
-else 
-{
+} else {
     $s = oci_parse($conn, "CREATE TABLE backups 
     ( backup_id number(20) PRIMARY KEY,
     backup_date DATE DEFAULT sysdate,

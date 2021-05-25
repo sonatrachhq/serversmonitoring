@@ -24,6 +24,8 @@ try {
         )
     );*/
     $mail->Host       = 'webmail.sonatrach.dz';                        //10.111.106.51  //mail.ep.sonatrach.dz // Specify main and backup SMTP servers
+    //$mail->Host       = '10.111.106.50;10.111.106.51;10.111.106.52';                        // Specify main and backup SMTP servers
+    $mail->SMTPAutoTLS = false;
     $mail->SMTPAuth   = false;                                   // Disable SMTP authentication
     
     #$mail->Username   = 'son8115@corp.sonatrach.dz';                              // SMTP username
